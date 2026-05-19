@@ -4,13 +4,14 @@
 
 import logging
 
-from stdnum.eu.vat import check_vies
-from stdnum.exceptions import InvalidComponent
+import requests
 
 from odoo import _, api, fields, models
-from odoo.tools import zeep
 
 _logger = logging.getLogger(__name__)
+
+# request URL
+URL_VIES_REST = "https://ec.europa.eu/taxation_customs/vies/rest-api/ms/{ms}/vat/{vat}"
 
 
 class ResPartner(models.Model):
@@ -32,14 +33,16 @@ class ResPartner(models.Model):
             partner.vat = "/"
             partner.vies_invalid = False
 
+    def _any_company_check_vies(self):
+        return (
+            self.env["res.company"].sudo().search_count([("vat_check_vies", "=", True)])
+        )
+
     def _cron_check_vies(self, limit=20):
         # Nothing to do if no company uses VIES validation
-        if (
-            not self.env["res.company"]
-            .sudo()
-            .search_count([("vat_check_vies", "=", True)])
-        ):
+        if not self._any_company_check_vies():
             return False
+        # Partners with unknown VIES validation. Not valid neither invalid.
         partners = self.search(
             [("vies_valid", "!=", True), ("vies_invalid", "!=", True)], limit=limit
         )
@@ -50,11 +53,7 @@ class ResPartner(models.Model):
 
     def _cron_clear_vat(self):
         # Nothing to do if no company uses VIES validation
-        if (
-            not self.env["res.company"]
-            .sudo()
-            .search_count([("vat_check_vies", "=", True)])
-        ):
+        if not self._any_company_check_vies():
             return False
         partners = self.search(
             [
@@ -74,59 +73,42 @@ class ResPartner(models.Model):
         - sync vies_invalid with parent_id
         - set vies_invalid to True in case VIES reports an invalid VAT ID
         """
-        if (
-            not self.env["res.company"]
-            .sudo()
-            .search_count([("vat_check_vies", "=", True)])
-        ):
+        if not self._any_company_check_vies():
             self.vies_valid = False
             return
 
         for partner in self:
-            if not partner.vies_vat_to_check:
-                partner.vies_valid = False
+            vat = partner.vies_vat_to_check
+            if not vat:
+                partner.vies_valid = partner.vies_invalid = False
                 continue
-            if (
-                partner.parent_id
-                and partner.parent_id.vies_vat_to_check == partner.vies_vat_to_check
-            ):
+            if partner.parent_id and partner.parent_id.vies_vat_to_check == vat:
                 partner.vies_valid = partner.parent_id.vies_valid
-                # Added sync of vies_invalid with parent
                 partner.vies_invalid = partner.parent_id.vies_invalid
                 continue
-            try:
-                _logger.info(
-                    "Calling VIES service to check VAT for validation: %s",
-                    partner.vies_vat_to_check,
-                )
-                vies_valid = check_vies(partner.vies_vat_to_check, timeout=10)
-                partner.vies_valid = vies_valid["valid"]
-                # Added set vies_invalid in case VIES reports invalid VAT id
-                if not vies_valid["valid"]:
-                    partner.vies_invalid = True
-            except (OSError, InvalidComponent, zeep.exceptions.Fault) as e:
-                if partner._origin.id:
-                    msg = ""
-                    if isinstance(e, OSError):
-                        msg = _(
-                            "Connection with the VIES server failed. The VAT number %s "
-                            "could not be validated.",
-                            partner.vies_vat_to_check,
-                        )
-                    elif isinstance(e, InvalidComponent):
-                        msg = _(
-                            "The VAT number %s could not be interpreted by the VIES "
-                            "server.",
-                            partner.vies_vat_to_check,
-                        )
-                    elif isinstance(e, zeep.exceptions.Fault):
-                        msg = _(
-                            "The request for VAT validation was not processed. VIES "
-                            "service has responded with the following error: %s",
-                            e.message,
-                        )
-                    partner._origin.message_post(body=msg)
+            partner.vies_valid, partner.vies_invalid = (
+                partner._do_request_vies_validation()
+            )
+
+    def _do_request_vies_validation(self):
+        """query the VIES REST API and update the partner accordingly"""
+        vat = self.vies_vat_to_check
+        try:
+            url = URL_VIES_REST.format(ms=vat[0:2], vat=vat)
+            _logger.info(f"Calling VIES service to check VAT for validation: {url}")
+            response = requests.get(url, timeout=10)
+
+            if response.status_code == 200:
+                result = response.json()
+                isValid = result.get("isValid")
+                return isValid, not isValid
+            elif response.status_code == 429:
+                _logger.warning("Reached VIES rate limit.")
+            else:
                 _logger.warning(
-                    "The VAT number %s failed VIES check.", partner.vies_vat_to_check
+                    f"VIES request failed with status {response.status_code}."
                 )
-                partner.vies_valid = False
+        except requests.exceptions.RequestException as e:
+            _logger.error("Failed to connect to VIES.", e)
+
+        return False, False

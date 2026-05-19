@@ -25,4 +25,9 @@
         <field name="active" eval="False" />
     </record>
 
+    <!-- Disable IAP cron -->
+    <record id="base_vat.vies_iap_check_update" model="ir.cron">
+        <field name="active" eval="False"/>
+    </record>
+
 </odoo>

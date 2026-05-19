@@ -13,3 +13,4 @@ To use this module, you need to:
 ![](static/description/invalid.png)
 
 You also get 2 planned action (cron job), disabled by default that will try to request new validation for the first 20 partners with failed validation, and another one that would clear VAT from all partners with invalid VAT.
+It also disables `base_vat` IAP cron job.
