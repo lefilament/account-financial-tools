@@ -112,9 +112,38 @@ class ResPartner(models.Model):
             response = requests.get(url, timeout=10)
 
             if response.status_code == 200:
-                valid = bool(response.json().get("isValid"))
-                self._post_vies_status(valid)
-                return valid, not valid
+                result = response.json()
+                # The VIES REST service answers HTTP 200 even when the member
+                # state service is unavailable: ``isValid`` is then False while
+                # ``userError`` holds the reason
+                # Only "VALID"/"INVALID" are definitive answers.
+                # Anything else must NOT mark the VAT as invalid, otherwise a
+                # legitimate number could be cleared.
+                user_error = result.get("userError")
+                if result.get("isValid"):
+                    self._post_vies_status(True)
+                    return True, False
+                if user_error == "INVALID":
+                    self._post_vies_status(False)
+                    return False, True
+                _logger.warning(
+                    "VIES could not validate VAT %s (userError: %s).",
+                    vat,
+                    user_error,
+                )
+                self._post_vies_message(
+                    _(
+                        "The VAT number %(vat)s could not be validated: the VIES "
+                        "service returned the error %(error)s. Please try again "
+                        "later.",
+                        vat=vat,
+                        error=user_error or _("unknown"),
+                    )
+                )
+            # I keep this HTTP code which should be the standard way of returning
+            # "too many requests"
+            # https://developer.mozilla.org/fr/docs/Web/HTTP/Reference/Status/429
+            # but I doubt we will ever encouter that until the VIES API is rewritten
             elif response.status_code == 429:
                 _logger.warning("Reached VIES rate limit.")
                 self._post_vies_message(
@@ -124,6 +153,8 @@ class ResPartner(models.Model):
                         vat,
                     )
                 )
+            # I'm not sure the server is programmed to return any status code other
+            # than 200, however, it might happen anyway if they have a proxy or so.
             else:
                 _logger.warning(
                     "VIES request failed with status %s.", response.status_code
@@ -136,6 +167,8 @@ class ResPartner(models.Model):
                         status=response.status_code,
                     )
                 )
+        # the connexion can fail in timeout if the user is not connected to the internet
+        # (tested in offline mode)
         except requests.exceptions.RequestException:
             _logger.error("Failed to connect to VIES.", exc_info=True)
             self._post_vies_message(
